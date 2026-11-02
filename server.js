@@ -3,7 +3,8 @@ import express from "express";
 
 const PORT = process.env.PORT || 3000;
 const GEMINI_API_KEY = process.env.GEMINI_API_KEY;
-const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-2.5-flash";
+const GEMINI_MODEL = process.env.GEMINI_MODEL || "gemini-3.8-flash";
+const GEMINI_FALLBACK_MODEL = process.env.GEMINI_FALLBACK_MODEL || ""; // opcional: modelo reserva se o principal estiver sobrecarregado
 const API_SECRET = process.env.API_SECRET || "";            // mesma senha do secrets.json (ia_api_key)
 const COOLDOWN_MS = Number(process.env.COOLDOWN_SECONDS || 5) * 1000;
 const MAX_PROMPT = 300;
@@ -54,24 +55,42 @@ app.post("/ask", async (req, res) => {
   const contents = [...hist, { role: "user", parts: [{ text: `(${player}) ${prompt}` }] }];
 
   try {
-    const r = await fetch(
-      `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent`,
-      {
-        method: "POST",
-        headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
-        body: JSON.stringify({
-          systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-          contents,
-          generationConfig: { maxOutputTokens: 400, temperature: 0.8, thinkingConfig: { thinkingBudget: 0 } },
-        }),
-        signal: AbortSignal.timeout(30000),
-      }
-    );
-    const data = await r.json();
+    // tenta o modelo principal até 3x (erros temporários 429/500/503) e depois o modelo reserva, se existir
+    const modelos = [GEMINI_MODEL, ...(GEMINI_FALLBACK_MODEL ? [GEMINI_FALLBACK_MODEL] : [])];
+    let data = null, ultimoStatus = 0;
 
-    if (!r.ok) {
-      console.error("Gemini erro:", r.status, JSON.stringify(data).slice(0, 300));
-      const msg = r.status === 429 ? "A IA ESTÁ MUITO OCUPADA AGORA. TENTE EM ALGUNS SEGUNDOS." : "A IA ESTÁ COM PROBLEMAS AGORA.";
+    for (const modelo of modelos) {
+      for (let tentativa = 1; tentativa <= 3; tentativa++) {
+        const r = await fetch(
+          `https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
+            body: JSON.stringify({
+              systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+              contents,
+              generationConfig: { maxOutputTokens: 1024, temperature: 0.8 },
+            }),
+            signal: AbortSignal.timeout(12000),
+          }
+        );
+        const corpo = await r.json().catch(() => ({}));
+        if (r.ok) { data = corpo; break; }
+
+        ultimoStatus = r.status;
+        console.error(`Gemini erro (${modelo}, tentativa ${tentativa}):`, r.status, JSON.stringify(corpo).slice(0, 300));
+        const temporario = r.status === 429 || r.status >= 500;
+        if (!temporario) break;                                  // erro definitivo: não adianta repetir
+        if (tentativa < 3) await new Promise((ok) => setTimeout(ok, 1500 * tentativa));
+      }
+      if (data) break;
+    }
+
+    if (!data) {
+      const msg = ultimoStatus === 429 || ultimoStatus === 503
+        ? "A IA ESTÁ MUITO OCUPADA AGORA. TENTE EM ALGUNS SEGUNDOS."
+        : "A IA ESTÁ COM PROBLEMAS AGORA.";
+      ultimaVez.delete(playerId);                                // não gasta o cooldown se falhou
       return res.status(502).json({ error: msg });
     }
 

@@ -35,6 +35,27 @@ setInterval(() => {
 // Render usa isso para saber se o serviço está vivo
 app.get("/", (_req, res) => res.json({ ok: true, service: "luna-ia-server" }));
 
+
+// Lista os modelos que a SUA chave pode usar. Abra no navegador:
+//   https://SEU-APP.onrender.com/models?senha=SUA_API_SECRET
+app.get("/models", async (req, res) => {
+  if (!API_SECRET || req.query.senha !== API_SECRET) return res.status(401).json({ error: "Não autorizado." });
+  try {
+    const r = await fetch("https://generativelanguage.googleapis.com/v1beta/models?pageSize=200", {
+      headers: { "x-goog-api-key": GEMINI_API_KEY },
+      signal: AbortSignal.timeout(15000),
+    });
+    const d = await r.json();
+    if (!r.ok) return res.status(502).json(d);
+    const lista = (d.models ?? [])
+      .filter((m) => (m.supportedGenerationMethods ?? []).includes("generateContent"))
+      .map((m) => m.name.replace("models/", ""));
+    res.json({ modelo_atual: GEMINI_MODEL, disponiveis: lista });
+  } catch (e) {
+    res.status(504).json({ error: String(e?.message ?? e) });
+  }
+});
+
 app.post("/ask", async (req, res) => {
   if (API_SECRET && req.get("x-api-key") !== API_SECRET) {
     return res.status(401).json({ error: "Não autorizado." });
@@ -59,23 +80,34 @@ app.post("/ask", async (req, res) => {
     const modelos = [GEMINI_MODEL, ...(GEMINI_FALLBACK_MODEL ? [GEMINI_FALLBACK_MODEL] : [])];
     let data = null, ultimoStatus = 0;
 
+    const inicio = Date.now();
+    const PRAZO_TOTAL = 52000;   // o addon espera no máximo 60s
     for (const modelo of modelos) {
       for (let tentativa = 1; tentativa <= 3; tentativa++) {
-        const r = await fetch(
-          `https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`,
-          {
-            method: "POST",
-            headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
-            body: JSON.stringify({
-              systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
-              contents,
-              generationConfig: { maxOutputTokens: 1024, temperature: 0.8 },
-            }),
-            signal: AbortSignal.timeout(12000),
-          }
-        );
-        const corpo = await r.json().catch(() => ({}));
-        if (r.ok) { data = corpo; break; }
+        const restante = PRAZO_TOTAL - (Date.now() - inicio);
+        if (restante < 4000) break;
+        let r, corpo = {};
+        try {
+          r = await fetch(
+            `https://generativelanguage.googleapis.com/v1beta/models/${modelo}:generateContent`,
+            {
+              method: "POST",
+              headers: { "Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY },
+              body: JSON.stringify({
+                systemInstruction: { parts: [{ text: SYSTEM_PROMPT }] },
+                contents,
+                generationConfig: { maxOutputTokens: 1024, temperature: 0.8 },
+              }),
+              signal: AbortSignal.timeout(Math.min(20000, restante)),
+            }
+          );
+          corpo = await r.json().catch(() => ({}));
+        } catch (e) {
+          ultimoStatus = 504;
+          console.error(`Gemini sem resposta (${modelo}, tentativa ${tentativa}): ${e?.message ?? e}`);
+          continue;                                              // timeout/rede: tenta de novo
+        }
+        if (r.ok) { data = corpo; console.log(`Gemini ok (${modelo}) em ${Date.now() - inicio}ms`); break; }
 
         ultimoStatus = r.status;
         console.error(`Gemini erro (${modelo}, tentativa ${tentativa}):`, r.status, JSON.stringify(corpo).slice(0, 300));
@@ -87,7 +119,7 @@ app.post("/ask", async (req, res) => {
     }
 
     if (!data) {
-      const msg = ultimoStatus === 429 || ultimoStatus === 503
+      const msg = ultimoStatus === 429 || ultimoStatus === 503 || ultimoStatus === 504
         ? "A IA ESTÁ MUITO OCUPADA AGORA. TENTE EM ALGUNS SEGUNDOS."
         : "A IA ESTÁ COM PROBLEMAS AGORA.";
       ultimaVez.delete(playerId);                                // não gasta o cooldown se falhou

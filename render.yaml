@@ -1,0 +1,17 @@
+services:
+  - type: web
+    name: luna-ia-server
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: GEMINI_API_KEY
+        sync: false        # você digita no painel do Render
+      - key: API_SECRET
+        sync: false        # invente uma senha (a mesma vai no secrets.json)
+      - key: GEMINI_MODEL
+        value: gemini-2.5-flash
+      - key: SERVER_NAME
+        value: Luna
